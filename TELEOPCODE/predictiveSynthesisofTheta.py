@@ -11,7 +11,19 @@ from rospy_tutorials.msg import Floats
 from rospy.numpy_msg import numpy_msg
 from scipy.linalg import logm as logm
 import csv
-
+import torch
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+import sklearn.model_selection as sk
+import torch.autograd as autograd
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import joblib
 rospy.init_node('qaim_jacob_multiply', anonymous=True)
 
 global default_hold_conf
@@ -19,6 +31,7 @@ global pub_to_ah
 
 
 #filename= 'trace_theta'+str(time.time())+'.csv'
+#Saving the traces of data for analysis
 filename2 = '../DATASET/TRANSORMER_DATA/training_data_for_transformer'+str(time.time())+'.csv'
 
 def save_to_csv(FILENAME, TRACE_CSV, type_open='a'):    
@@ -27,7 +40,78 @@ def save_to_csv(FILENAME, TRACE_CSV, type_open='a'):
 		writer.writerow(TRACE_CSV)
 
 
-#save_to_csv(filename, ['ThetaX', 'ThetaY', 'ThetaZ'], 'w')
+class LSTMNET(nn.Module):
+    def __init__(self, batch_size, input_len, output_len, lstm_units = 4, num_layers=1):
+        super(LSTMNET, self).__init__()
+        self.input_len = input_len
+        self.output_len = output_len
+        self.num_layers = num_layers
+        self.batch_size = batch_size
+        #input_size = no of features = 1
+        #hidden_size = no of lstm units in the layer
+        #num_layers = no of lstm layers
+        self.lstm_units = lstm_units
+        self.lstm1 = nn.LSTM(input_size= 1, hidden_size= lstm_units, num_layers=num_layers,batch_first=True, dropout=0.6)
+        
+        self.linear0 = nn.Linear(in_features= 20, out_features=10)
+        
+        self.linear1 = nn.Linear(in_features= lstm_units, out_features=10)
+        self.linear2 = nn.Linear(in_features= 10, out_features=10)
+        self.ll = nn.Linear(in_features= 10, out_features=output_len)
+        self.hidden = (torch.zeros(1*self.num_layers, self.batch_size, self.lstm_units).double(), torch.zeros(1*self.num_layers, self.batch_size, self.lstm_units).double())
+        #print(self.hidden[0].device)
+        #print(self.hidden.shape)
+        #self.hidden[0]= self.hidden[0].to(device)
+        #self.hidden[1] = self.hidden[1].to(device)
+        self.tanh = nn.Tanh()
+        self.sigmoid = nn.Sigmoid()
+    
+    def reset_hidden_states(self,bs):
+        self.hidden = (torch.zeros(1*self.num_layers, bs, self.lstm_units).double(), torch.zeros(1*self.num_layers, bs, self.lstm_units).double())
+        
+    def forward(self,x):
+        #print(x.shape)
+        #print(x)
+        #print(x.unsqueeze(-1).shape)
+        #print(self.hidden.shape)
+        #print(self.hidden)
+        lstm_out, (h,c) = self.lstm1(x.unsqueeze(-1), self.hidden)
+        self.hidden= (h.detach(),c.detach())
+        #c.detach_()
+        #h.detach_()
+        #self.hidden = (h.detach(), c.detach())
+        #print(ht.shape)
+        #ht=ht.to(device)
+        #ct=ct.to(device)
+        
+        lstm_out = lstm_out[:,-1,:]
+        #print(ht.shape)
+        #either lstm_out goes to next or ht goes
+        #lstm_out= h.detach()[-1]
+        lin1_out = self.linear1(lstm_out)
+        #Add RELU
+        #lin0_out = F.relu(self.linear0(x))
+        ll_out = self.ll(lin1_out)
+        #x = self.linear0(x)
+        #print(x.shape)
+        
+        #x = self.linear2(x)
+        #Add RELU
+        return ll_out
+input_cardinality = 20
+output_cardinality = 4
+
+model_ckp_path = "../MODEL_CHECKPOINTS/model_lookahead"+str(output_cardinality)+".pth"
+scaler_filename = "../SCALER_DUMPS/min_max_scaler_lookahead"+str(output_cardinality)+".save"
+batch_size = 1
+predictor = LSTMNET(batch_size=batch_size,input_len=input_cardinality,output_len=output_cardinality)
+predictor.load_state_dict(torch.load(model_ckp_path))
+#net2.eval()
+predictor.reset_hidden_states(bs=1)
+scaler = joblib.load(scaler_filename) 
+
+predictor.eval() 
+predictor = predictor.double()
 
 
 
@@ -401,7 +485,7 @@ def main(debug):
 	#RUN cube holding pose.py prior to this script
 	#1. Set Data Structure of basic variables
 	PHI, Theta0, alpha, beta, gamma = set_initial_params(debug)
-
+	ALL_INPUT_TO_LSTM=list()
 	#set_cube_holding_pose()
 
 	#2. GET ANGLE MAPPED HAPTIC GLOVE DATA
@@ -413,9 +497,9 @@ def main(debug):
 	Q1 =  mapper_angle(q1)
 
 	
-
+	n_time = 0
 	#3. LOOP FOR: GET_DESIREDTHETA, CONTROL_AH
-	for i in range(50):
+	while True:
 		Q1 =  mapper_angle(q1)
 		#### time.sleep(1/240.)  COMMENTED ON 8SEP
 		#while True:
@@ -426,11 +510,28 @@ def main(debug):
 			q2 = get_haptic_glove_data()
 		Q2 = mapper_angle(q2)
 		#3. GET DESIRED THETA
-		if i ==0:
+		if n_time==0:
 			Theta0, r01, r02, r03, DATA_AH = get_desired_theta(Q1, Q2, t1, t2, PHI, Theta0, alpha, beta, gamma, JointState(), True, debug)
 		else:
 			Theta0, r01, r02, r03 = get_desired_theta(Q1, Q2, t1, t2, PHI, Theta0, alpha, beta, gamma, DATA_AH, False, debug)
 		#print(DATA_AH.position)
+		#RNN Pipeline
+		ALL_INPUT_TO_LSTM.append(Theta0[0])
+		if n_time>20:
+			#about certain 'x' axis
+			INPUT_TO_LSTM= ALL_INPUT_TO_LSTM[-input_cardinality-1:-1]
+			print(len(INPUT_TO_LSTM))
+			#print(INPUT_TO_LSTM)
+
+			INPUT_TO_LSTM_scaled = scaler.transform(np.asarray(INPUT_TO_LSTM).reshape(len(INPUT_TO_LSTM),1))
+			INPUT_TO_LSTM_torch_scaled = torch.tensor(INPUT_TO_LSTM_scaled.transpose(), dtype=torch.float64)
+			Theta0_pred_scaled = predictor(INPUT_TO_LSTM_torch_scaled)
+			Theta0_pred = scaler.inverse_transform(Theta0_pred_scaled.detach().numpy())
+			Theta0[0] = Theta0_pred[0][output_cardinality-1]
+		print("*********")	
+		#4. CONTROL AH
+
+
 		#4. CONTROL AH
 		const1= 0.7
 		DATA_AH = control_AH(Theta0, r01, r02, r03, t1, t2, DATA_AH, const1,debug)
@@ -439,7 +540,7 @@ def main(debug):
 		#time.sleep(1/10.)np.array([5, 0, 0]).reshape(3,)
 		t1 = t2
 		q1.position = list(q2.position).copy()
-
+		n_time = n_time+1
 
 
 if __name__=="__main__":
