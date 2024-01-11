@@ -11,3 +11,4 @@ Teleoperation Work
 5. Results
 
 
+The data used in this project is submitted to IEEE Robotics and Automation Letters in Aug 2022. The data must not be used without credit to the authors (before or after the data is published).
